@@ -35,6 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const backToStep2Button = getElementById('backToStep2');
         const startOverButton = getElementById('startOver');
         const connectButton = getElementById('connectButton');
+        const resetButton = getElementById('resetButton');
         const disconnectButton = getElementById('disconnectButton');
         const flashButton = getElementById('flashButton');
         const eraseButton = getElementById('eraseButton');
@@ -150,6 +151,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         connectButton.addEventListener('click', connect);
+        resetButton.addEventListener('click', resetDevice);
         disconnectButton.addEventListener('click', disconnect);
         flashButton.addEventListener('click', flash);
         eraseButton.addEventListener('click', eraseFlash);
@@ -472,6 +474,34 @@ document.addEventListener('DOMContentLoaded', () => {
             chipInfoElem.innerHTML = `<span class="status-indicator status-disconnected"></span> Disconnected`;
             if (nextToStep2Button) nextToStep2Button.disabled = true;
             return true;
+        }
+
+        async function resetDevice() {
+            if (!transport || !connected || !espLoader) {
+                espLoaderTerminal.writeLine("Not connected to a device. Cannot reset.");
+                return;
+            }
+
+            try {
+                if (resetButton) resetButton.disabled = true;
+                espLoaderTerminal.writeLine("Resetting device...");
+
+                // RTS toggle method (ESP-IDF monitor style - most reliable for ESP32)
+                // RTS=true = EN=LOW (reset), RTS=false = EN=HIGH (run)
+                // Put chip in reset (EN=LOW)
+                await transport.setRTS(true);
+                await new Promise((resolve) => setTimeout(resolve, 50));
+                // Release reset (EN=HIGH) - let chip boot
+                await transport.setRTS(false);
+                await new Promise((resolve) => setTimeout(resolve, 50));
+
+                espLoaderTerminal.writeLine("Device reset completed. Device should restart now.");
+            } catch (error) {
+                console.error("Error resetting device:", error);
+                espLoaderTerminal.writeLine(`Error resetting device: ${error.message}`);
+            } finally {
+                if (resetButton) resetButton.disabled = false;
+            }
         }
 
         async function flash(preserveSettings = true) {
@@ -979,6 +1009,7 @@ document.addEventListener('DOMContentLoaded', () => {
         function updateButtonStates() {
             // Connection buttons
             if (connectButton) connectButton.disabled = connected;
+            if (resetButton) resetButton.disabled = !connected;
             if (disconnectButton) disconnectButton.disabled = !connected;
 
             // Action buttons depend on method and files/connection
