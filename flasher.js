@@ -476,16 +476,14 @@ document.addEventListener('DOMContentLoaded', () => {
             return true;
         }
 
-        async function resetDevice() {
+        // Internal reset function - performs the actual reset
+        async function performReset(silent = false) {
             if (!transport || !connected || !espLoader) {
-                espLoaderTerminal.writeLine("Not connected to a device. Cannot reset.");
-                return;
+                if (!silent) espLoaderTerminal.writeLine("Not connected to a device. Cannot reset.");
+                return false;
             }
 
             try {
-                if (resetButton) resetButton.disabled = true;
-                espLoaderTerminal.writeLine("Resetting device...");
-
                 // RTS toggle method (ESP-IDF monitor style - most reliable for ESP32)
                 // RTS=true = EN=LOW (reset), RTS=false = EN=HIGH (run)
                 // Put chip in reset (EN=LOW)
@@ -495,7 +493,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 await transport.setRTS(false);
                 await new Promise((resolve) => setTimeout(resolve, 50));
 
-                espLoaderTerminal.writeLine("Device reset completed. Device should restart now.");
+                if (!silent) {
+                    espLoaderTerminal.writeLine("Device reset completed. Device should restart now.");
+                }
+                return true;
+            } catch (error) {
+                console.error("Error resetting device:", error);
+                if (!silent) {
+                    espLoaderTerminal.writeLine(`Error resetting device: ${error.message}`);
+                }
+                return false;
+            }
+        }
+
+        // Public reset function - called by the reset button
+        async function resetDevice() {
+            if (!transport || !connected || !espLoader) {
+                espLoaderTerminal.writeLine("Not connected to a device. Cannot reset.");
+                return;
+            }
+
+            try {
+                if (resetButton) resetButton.disabled = true;
+                espLoaderTerminal.writeLine("Resetting device...");
+                await performReset(false);
             } catch (error) {
                 console.error("Error resetting device:", error);
                 espLoaderTerminal.writeLine(`Error resetting device: ${error.message}`);
@@ -750,12 +771,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 chipInfoElem.innerHTML = `<span class="status-indicator status-success"></span> Flash Complete`;
                 updateStatusIndicator('success', 'Flash complete!', 'Attempting device reset...');
 
-                try {
-                    await espLoader.softReset(true);
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                } catch (resetError) {
-                    console.error("Soft reset failed:", resetError);
-                }
+                // Reset device after successful flash
+                espLoaderTerminal.writeLine("Resetting device after flash...");
+                await performReset(false);
 
                 try {
                     await disconnect();
