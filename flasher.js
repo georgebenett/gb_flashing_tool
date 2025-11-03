@@ -1,27 +1,4 @@
 document.addEventListener('DOMContentLoaded', () => {
-    // Dark mode toggle functionality
-    const titleToggle = document.getElementById('darkModeToggle');
-    if (titleToggle) {
-        titleToggle.addEventListener('click', () => {
-            // Add gravity effect to title
-            titleToggle.style.transition = 'all 0.5s ease';
-            titleToggle.style.transform = 'translateY(10px)';
-
-            // Toggle dark mode class
-            document.documentElement.classList.toggle('dark-mode');
-
-            // Apply gravity effect
-            setTimeout(() => {
-                titleToggle.style.transform = 'translateY(0)';
-            }, 100);
-
-            // Reset transition
-            setTimeout(() => {
-                titleToggle.style.transition = '';
-            }, 600);
-        });
-    }
-
     window.addEventListener("dragover", (event) => {
         if (!event.target.closest('.custom-file-upload')) return;
         event.preventDefault();
@@ -1075,7 +1052,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const webSerialModal = new bootstrap.Modal(getElementById('webSerialModal'));
             webSerialModal.show();
         } else {
-            espLoaderTerminal.writeLine("GB Remote Config Tool ready. Connect your ESP32 device to get started.");
+            espLoaderTerminal.writeLine("GB Remote Flashing Tool ready. Connect your ESP32 device to get started.");
         }
 
         // Initialize the UI

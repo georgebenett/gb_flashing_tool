@@ -113,15 +113,6 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Initialize eyelid simulation when dark mode is toggled
-    const titleToggle = document.getElementById('darkModeToggle');
-    if (titleToggle) {
-        titleToggle.addEventListener('click', () => {
-            // Small delay to ensure dark mode class is applied
-            setTimeout(initEyelidSimulation, 100);
-        });
-    }
-
     // Initialize if already in dark mode
     if (document.documentElement.classList.contains('dark-mode')) {
         setTimeout(initEyelidSimulation, 500);
