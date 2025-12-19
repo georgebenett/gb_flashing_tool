@@ -238,17 +238,21 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // Detect device type using binary protocol
-        async function detectDeviceType() {
-            let binarySerialPort = null;
+        // Takes an optional port parameter - if provided, uses it; otherwise requests a new one
+        async function detectDeviceType(serialPort = null) {
+            let binarySerialPort = serialPort;
             let binaryReader = null;
             let binaryWriter = null;
             let binaryBuffer = new Uint8Array(0);
 
             try {
                 espLoaderTerminal.writeLine("Detecting device type...");
-                
-                // Request serial port for binary protocol
-                binarySerialPort = await navigator.serial.requestPort();
+
+                // Request serial port only if not provided
+                if (!binarySerialPort) {
+                    binarySerialPort = await navigator.serial.requestPort();
+                }
+
                 await binarySerialPort.open({
                     baudRate: 115200,
                     dataBits: 8,
@@ -328,7 +332,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
 
-                // Clean up
+                // Clean up reader/writer
                 if (binaryReader) {
                     try {
                         await binaryReader.cancel();
@@ -340,17 +344,20 @@ document.addEventListener('DOMContentLoaded', () => {
                         await binaryWriter.releaseLock();
                     } catch (e) {}
                 }
+                // Close the port - caller will reopen it for esptool
                 if (binarySerialPort) {
                     try {
                         await binarySerialPort.close();
+                        // Small delay to ensure port is fully closed
+                        await new Promise(resolve => setTimeout(resolve, 100));
                     } catch (e) {}
                 }
 
-                return deviceType;
+                return { deviceType, port: binarySerialPort };
 
             } catch (error) {
                 espLoaderTerminal.writeLine(`Device detection error: ${error.message}`);
-                
+
                 // Clean up on error
                 if (binaryReader) {
                     try {
@@ -363,13 +370,14 @@ document.addEventListener('DOMContentLoaded', () => {
                         await binaryWriter.releaseLock();
                     } catch (e) {}
                 }
+                // Close the port on error too
                 if (binarySerialPort) {
                     try {
                         await binarySerialPort.close();
                     } catch (e) {}
                 }
-                
-                return null;
+
+                return { deviceType: null, port: binarySerialPort };
             }
         }
 
@@ -395,18 +403,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Pattern: {deviceType}_v{version}.zip (e.g., lite_v1.1.7.zip, dual_throttle_v1.1.7.zip)
                 let zipAsset = null;
                 if (deviceType === 'lite') {
-                    zipAsset = release.assets.find(asset => 
+                    zipAsset = release.assets.find(asset =>
                         asset.name.startsWith('lite_v') && asset.name.endsWith('.zip')
                     );
                 } else if (deviceType === 'dual_throttle') {
-                    zipAsset = release.assets.find(asset => 
+                    zipAsset = release.assets.find(asset =>
                         asset.name.startsWith('dual_throttle_v') && asset.name.endsWith('.zip')
                     );
                 }
 
                 if (!zipAsset) {
                     // Fallback: try to find any matching zip with device type in name
-                    zipAsset = release.assets.find(asset => 
+                    zipAsset = release.assets.find(asset =>
                         asset.name.includes(deviceType) && asset.name.endsWith('.zip')
                     );
                 }
@@ -639,27 +647,25 @@ document.addEventListener('DOMContentLoaded', () => {
              if (connectButton) connectButton.disabled = true;
 
             try {
-                // Step 1: Detect device type using binary protocol
+                // Step 1: Request serial port once (user selects device)
+                espLoaderTerminal.writeLine(`Requesting WebSerial port. Select your device from the popup...`);
+                const device = await navigator.serial.requestPort();
+
+                // Step 2: Detect device type using binary protocol (using the same port)
                 espLoaderTerminal.writeLine(`Step 1: Detecting device type...`);
-                espLoaderTerminal.writeLine(`Requesting WebSerial port for device detection. Select your device from the popup...`);
-                
-                const detectedType = await detectDeviceType();
-                
-                if (detectedType) {
-                    espLoaderTerminal.writeLine(`Device type detected: ${detectedType}`);
-                    detectedDeviceType = detectedType;
+
+                const detectionResult = await detectDeviceType(device);
+
+                if (detectionResult.deviceType) {
+                    espLoaderTerminal.writeLine(`Device type detected: ${detectionResult.deviceType}`);
+                    detectedDeviceType = detectionResult.deviceType;
                 } else {
                     espLoaderTerminal.writeLine(`Warning: Could not detect device type. Will proceed with connection anyway.`);
                 }
 
-                // Step 2: Disconnect from binary protocol and reconnect with esptool
+                // Step 3: Connect with esptool using the same device
+                // (Port was already closed by detectDeviceType, esptool will open it)
                 espLoaderTerminal.writeLine(`Step 2: Connecting with esptool for flashing...`);
-                espLoaderTerminal.writeLine(`Requesting WebSerial port again. Select your device from the popup...`);
-
-                // --- Serial Options ---
-                let serialOptions = {}; // No filters - show all devices
-
-                const device = await navigator.serial.requestPort(serialOptions); // Use potentially modified options
                 transport = new window.esptoolJS.Transport(device);
 
                 espLoaderTerminal.writeLine("Connecting to device...");
