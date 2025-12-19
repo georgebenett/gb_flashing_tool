@@ -77,6 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let currentStep = 1;
         let extractedGbFiles = null;
         let selectedFirmwareMethod = null; // To track 'download' or 'manual'
+        let detectedDeviceType = null; // 'lite' or 'dual_throttle' - detected from device
 
         // --- Initial UI State ---
         if (appFileInfoElem) appFileInfoElem.textContent = 'No file selected';
@@ -148,6 +149,279 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 });
             });
+        }
+
+        // --- Binary Protocol Constants (for device detection) ---
+        const BINARY_PROTOCOL = {
+            START_BYTE: 0xAA,
+            CMD_GET_FIRMWARE_VERSION: 0x02,
+            RSP_FIRMWARE_VERSION: 0x82,
+            RSP_ACK: 0x80,
+            ERR_OK: 0x00
+        };
+
+        // CRC-16-CCITT calculation
+        function calcCRC16(data) {
+            let crc = 0xFFFF;
+            for (let i = 0; i < data.length; i++) {
+                crc ^= (data[i] << 8);
+                for (let bit = 0; bit < 8; bit++) {
+                    if (crc & 0x8000) {
+                        crc = (crc << 1) ^ 0x1021;
+                    } else {
+                        crc = crc << 1;
+                    }
+                }
+                crc &= 0xFFFF;
+            }
+            return crc;
+        }
+
+        // Build a binary packet
+        function buildBinaryPacket(cmdId, payload = new Uint8Array(0)) {
+            const length = payload.length;
+            const packet = new Uint8Array(6 + length);
+
+            let idx = 0;
+            packet[idx++] = BINARY_PROTOCOL.START_BYTE;
+            packet[idx++] = cmdId;
+            packet[idx++] = length & 0xFF;        // LSB
+            packet[idx++] = (length >> 8) & 0xFF; // MSB
+
+            // Copy payload
+            for (let i = 0; i < payload.length; i++) {
+                packet[idx++] = payload[i];
+            }
+
+            // Calculate CRC over CMD + LEN + PAYLOAD
+            const crcData = packet.slice(1, 4 + length);
+            const crc = calcCRC16(crcData);
+
+            packet[idx++] = crc & 0xFF;        // CRC LSB
+            packet[idx++] = (crc >> 8) & 0xFF; // CRC MSB
+
+            return packet;
+        }
+
+        // Parse binary packet from buffer
+        function parseBinaryPacket(buffer) {
+            if (buffer.length < 6) return null; // Minimum packet size
+
+            let idx = 0;
+            if (buffer[idx++] !== BINARY_PROTOCOL.START_BYTE) return null;
+
+            const cmdId = buffer[idx++];
+            const length = buffer[idx++] | (buffer[idx++] << 8);
+
+            if (buffer.length < 6 + length) return null; // Not enough data
+
+            const payload = buffer.slice(idx, idx + length);
+            idx += length;
+
+            const crc = buffer[idx++] | (buffer[idx++] << 8);
+
+            // Verify CRC
+            const crcData = new Uint8Array(3 + length);
+            crcData[0] = cmdId;
+            crcData[1] = length & 0xFF;
+            crcData[2] = (length >> 8) & 0xFF;
+            for (let i = 0; i < length; i++) {
+                crcData[3 + i] = payload[i];
+            }
+            const calculatedCrc = calcCRC16(crcData);
+
+            if (calculatedCrc !== crc) {
+                return null; // CRC mismatch
+            }
+
+            return { cmdId, payload };
+        }
+
+        // Detect device type using binary protocol
+        async function detectDeviceType() {
+            let binarySerialPort = null;
+            let binaryReader = null;
+            let binaryWriter = null;
+            let binaryBuffer = new Uint8Array(0);
+
+            try {
+                espLoaderTerminal.writeLine("Detecting device type...");
+                
+                // Request serial port for binary protocol
+                binarySerialPort = await navigator.serial.requestPort();
+                await binarySerialPort.open({
+                    baudRate: 115200,
+                    dataBits: 8,
+                    stopBits: 1,
+                    parity: 'none'
+                });
+
+                binaryReader = binarySerialPort.readable.getReader();
+                binaryWriter = binarySerialPort.writable.getWriter();
+
+                // Send GET_FIRMWARE_VERSION command
+                const packet = buildBinaryPacket(BINARY_PROTOCOL.CMD_GET_FIRMWARE_VERSION);
+                await binaryWriter.write(packet);
+                espLoaderTerminal.writeLine("Sent firmware version request...");
+
+                // Read response with timeout
+                const timeout = 3000; // 3 seconds
+                const startTime = Date.now();
+                let responseReceived = false;
+                let deviceType = null;
+
+                while (!responseReceived && (Date.now() - startTime) < timeout) {
+                    try {
+                        const { value, done } = await binaryReader.read();
+                        if (done) break;
+
+                        if (value) {
+                            // Append to buffer
+                            const newBuffer = new Uint8Array(binaryBuffer.length + value.length);
+                            newBuffer.set(binaryBuffer);
+                            newBuffer.set(value, binaryBuffer.length);
+                            binaryBuffer = newBuffer;
+
+                            // Try to parse packet
+                            const parsed = parseBinaryPacket(binaryBuffer);
+                            if (parsed) {
+                                if (parsed.cmdId === BINARY_PROTOCOL.RSP_FIRMWARE_VERSION) {
+                                    // Parse firmware version response
+                                    let idx = 0;
+                                    if (parsed.payload.length < 3) break;
+
+                                    const major = parsed.payload[idx++];
+                                    const minor = parsed.payload[idx++];
+                                    const patch = parsed.payload[idx++];
+
+                                    // Build date
+                                    const buildLen = parsed.payload[idx++];
+                                    idx += buildLen;
+
+                                    // Model name (this is what we need)
+                                    const modelLen = parsed.payload[idx++];
+                                    const modelStr = new TextDecoder().decode(parsed.payload.slice(idx, idx + modelLen));
+
+                                    // Determine device type from model name
+                                    const modelLower = modelStr.toLowerCase();
+                                    if (modelLower.includes('dual') && !modelLower.includes('dual_pro')) {
+                                        deviceType = 'dual_throttle';
+                                    } else if (modelLower.includes('lite')) {
+                                        deviceType = 'lite';
+                                    }
+
+                                    if (deviceType) {
+                                        espLoaderTerminal.writeLine(`Detected device type: ${deviceType} (model: ${modelStr})`);
+                                        detectedDeviceType = deviceType;
+                                        responseReceived = true;
+                                    }
+                                }
+                                // Remove processed packet from buffer
+                                const packetSize = 6 + (parsed.payload.length);
+                                binaryBuffer = binaryBuffer.slice(packetSize);
+                            }
+                        }
+                    } catch (readError) {
+                        if (readError.name !== 'TimeoutError') {
+                            throw readError;
+                        }
+                    }
+                }
+
+                // Clean up
+                if (binaryReader) {
+                    try {
+                        await binaryReader.cancel();
+                        await binaryReader.releaseLock();
+                    } catch (e) {}
+                }
+                if (binaryWriter) {
+                    try {
+                        await binaryWriter.releaseLock();
+                    } catch (e) {}
+                }
+                if (binarySerialPort) {
+                    try {
+                        await binarySerialPort.close();
+                    } catch (e) {}
+                }
+
+                return deviceType;
+
+            } catch (error) {
+                espLoaderTerminal.writeLine(`Device detection error: ${error.message}`);
+                
+                // Clean up on error
+                if (binaryReader) {
+                    try {
+                        await binaryReader.cancel();
+                        await binaryReader.releaseLock();
+                    } catch (e) {}
+                }
+                if (binaryWriter) {
+                    try {
+                        await binaryWriter.releaseLock();
+                    } catch (e) {}
+                }
+                if (binarySerialPort) {
+                    try {
+                        await binarySerialPort.close();
+                    } catch (e) {}
+                }
+                
+                return null;
+            }
+        }
+
+        // Fetch latest release and get matching zip file URL
+        async function getLatestFirmwareUrl(deviceType) {
+            if (!deviceType) {
+                throw new Error('Device type not detected');
+            }
+
+            try {
+                espLoaderTerminal.writeLine(`Fetching latest release for ${deviceType}...`);
+                const apiUrl = 'https://api.github.com/repos/georgebenett/gb_remote/releases/latest';
+                const response = await fetch(apiUrl);
+
+                if (!response.ok) {
+                    throw new Error(`GitHub API Error: ${response.status} ${response.statusText}`);
+                }
+
+                const release = await response.json();
+                espLoaderTerminal.writeLine(`Found release: ${release.tag_name}`);
+
+                // Match device type to zip file name
+                // Pattern: {deviceType}_v{version}.zip (e.g., lite_v1.1.7.zip, dual_throttle_v1.1.7.zip)
+                let zipAsset = null;
+                if (deviceType === 'lite') {
+                    zipAsset = release.assets.find(asset => 
+                        asset.name.startsWith('lite_v') && asset.name.endsWith('.zip')
+                    );
+                } else if (deviceType === 'dual_throttle') {
+                    zipAsset = release.assets.find(asset => 
+                        asset.name.startsWith('dual_throttle_v') && asset.name.endsWith('.zip')
+                    );
+                }
+
+                if (!zipAsset) {
+                    // Fallback: try to find any matching zip with device type in name
+                    zipAsset = release.assets.find(asset => 
+                        asset.name.includes(deviceType) && asset.name.endsWith('.zip')
+                    );
+                }
+
+                if (!zipAsset) {
+                    throw new Error(`No matching firmware zip found for ${deviceType} in release ${release.tag_name}`);
+                }
+
+                espLoaderTerminal.writeLine(`Found firmware: ${zipAsset.name}`);
+                return zipAsset.browser_download_url;
+
+            } catch (error) {
+                espLoaderTerminal.writeLine(`Error fetching firmware URL: ${error.message}`);
+                throw error;
+            }
         }
 
         connectButton.addEventListener('click', connect);
@@ -365,7 +639,22 @@ document.addEventListener('DOMContentLoaded', () => {
              if (connectButton) connectButton.disabled = true;
 
             try {
-                espLoaderTerminal.writeLine(`Requesting WebSerial port. Select your device from the popup...`);
+                // Step 1: Detect device type using binary protocol
+                espLoaderTerminal.writeLine(`Step 1: Detecting device type...`);
+                espLoaderTerminal.writeLine(`Requesting WebSerial port for device detection. Select your device from the popup...`);
+                
+                const detectedType = await detectDeviceType();
+                
+                if (detectedType) {
+                    espLoaderTerminal.writeLine(`Device type detected: ${detectedType}`);
+                    detectedDeviceType = detectedType;
+                } else {
+                    espLoaderTerminal.writeLine(`Warning: Could not detect device type. Will proceed with connection anyway.`);
+                }
+
+                // Step 2: Disconnect from binary protocol and reconnect with esptool
+                espLoaderTerminal.writeLine(`Step 2: Connecting with esptool for flashing...`);
+                espLoaderTerminal.writeLine(`Requesting WebSerial port again. Select your device from the popup...`);
 
                 // --- Serial Options ---
                 let serialOptions = {}; // No filters - show all devices
@@ -384,6 +673,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 chipType = await espLoader.main();
                 espLoaderTerminal.writeLine(`Connected to ${chipType}`);
                 let chipInfoText = `<span class="status-indicator status-connected"></span> Connected to ${chipType}`;
+                if (detectedDeviceType) {
+                    chipInfoText += ` (${detectedDeviceType})`;
+                }
                 chipInfoElem.innerHTML = chipInfoText;
                 connected = true;
                 updateButtonStates();
@@ -1399,10 +1691,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 console.log('[Debug] loadGbZip: JSZip loaded successfully.');
 
                 // --- Files to extract ---
+                // Determine app binary name based on device type
+                let appBinaryName = 'gb_controller_lite.bin'; // Default
+                if (detectedDeviceType === 'dual_throttle') {
+                    appBinaryName = 'gb_controller_dual_throttle.bin';
+                } else if (detectedDeviceType === 'lite') {
+                    appBinaryName = 'gb_controller_lite.bin';
+                }
+
                 const filesToExtract = {
-                    app: { name: 'gb_controller_lite.bin', data: null, elem: appFileInfoElem, addressInput: appAddressInput, type: 'Application' }, // Updated for gb_remote
-                    bootloader: { name: 'bootloader.bin', data: null, elem: bootloaderFileInfoElem, addressInput: bootloaderAddressInput, type: 'Bootloader' }, // Correct
-                    partition: { name: 'partition-table.bin', data: null, elem: partitionFileInfoElem, addressInput: partitionAddressInput, type: 'Partition' } // Correct
+                    app: { name: appBinaryName, data: null, elem: appFileInfoElem, addressInput: appAddressInput, type: 'Application' },
+                    bootloader: { name: 'bootloader.bin', data: null, elem: bootloaderFileInfoElem, addressInput: bootloaderAddressInput, type: 'Bootloader' },
+                    partition: { name: 'partition-table.bin', data: null, elem: partitionFileInfoElem, addressInput: partitionAddressInput, type: 'Partition' }
                 };
 
                 let foundCount = 0;
@@ -1417,8 +1717,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     // If not found, try alternative names for specific file types
                     if (!fileEntry) {
                         if (key === 'app') {
-                            // Try various possible names for the main application
-                            const appNames = ['firmware.bin', 'gb_controller_lite.bin', 'gb_remote_lite.bin', 'app.bin', 'main.bin'];
+                            // Try various possible names for the main application based on device type
+                            let appNames = [];
+                            if (detectedDeviceType === 'dual_throttle') {
+                                appNames = ['gb_controller_dual_throttle.bin', 'dual_throttle.bin', 'firmware.bin', 'app.bin', 'main.bin'];
+                            } else {
+                                appNames = ['gb_controller_lite.bin', 'gb_remote_lite.bin', 'lite.bin', 'firmware.bin', 'app.bin', 'main.bin'];
+                            }
                             for (const altName of appNames) {
                                 fileEntry = zip.file(altName);
                                 if (fileEntry) {
@@ -1698,45 +2003,25 @@ document.addEventListener('DOMContentLoaded', () => {
         // Function to automatically download and extract files
         async function downloadAndExtractFiles() {
             try {
+                // Check if device type was detected
+                if (!detectedDeviceType) {
+                    throw new Error('Device type not detected. Please connect to your device first.');
+                }
+
                 // Update status
                 if (gbStatusElem) {
-                    gbStatusElem.textContent = 'Fetching latest release from georgebenett/gb_remote...';
+                    gbStatusElem.textContent = `Fetching latest ${detectedDeviceType} firmware from georgebenett/gb_remote...`;
                     gbStatusElem.className = 'form-text mt-2 loading';
                 }
 
-                // Get the latest release URL for gb_remote_lite.zip
-                const apiUrl = 'https://api.github.com/repos/georgebenett/gb_remote/releases/latest';
-                espLoaderTerminal.writeLine('Fetching latest release from georgebenett/gb_remote...');
-
-                const response = await fetch(apiUrl);
-                if (!response.ok) {
-                    throw new Error(`GitHub API Error: ${response.status} ${response.statusText}`);
-                }
-
-                const release = await response.json();
-
-                // Look for assets matching the actual naming pattern: "gb_remote_lite_vX.X.X.zip"
-                // First try to find an asset that starts with "gb_remote_lite_v" and ends with ".zip"
-                let zipAsset = release.assets.find(asset =>
-                    asset.name.startsWith('gb_remote_lite_v') && asset.name.endsWith('.zip')
-                );
-
-                // Fallback to the old naming pattern for backward compatibility
-                if (!zipAsset) {
-                    zipAsset = release.assets.find(asset => asset.name === 'gb_remote_lite.zip');
-                }
-
-                if (!zipAsset) {
-                    throw new Error('GB Remote Lite firmware zip file not found in latest release');
-                }
-
-                espLoaderTerminal.writeLine(`Found firmware zip file "${zipAsset.name}" in release ${release.tag_name}`);
+                // Get the latest release URL matching the device type
+                const zipUrl = await getLatestFirmwareUrl(detectedDeviceType);
 
                 // Download and extract the ZIP
-                await loadGbZip(zipAsset.browser_download_url);
+                await loadGbZip(zipUrl);
 
             } catch (error) {
-                console.error('Error downloading GB Remote Lite firmware:', error);
+                console.error('Error downloading GB Remote firmware:', error);
                 espLoaderTerminal.writeLine(`❌ Error downloading firmware: ${error.message}`);
                 if (gbStatusElem) {
                     gbStatusElem.textContent = `Error: ${error.message}`;
